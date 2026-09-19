@@ -2064,10 +2064,15 @@ export function parse_term_ops(p: Parse, tm: LTerm, lvl: number): LTerm {
       parse_bump(p);
       const tm = out.$ === "Ref" ? p.book.tmps[out.k] : undefined;
       const ts: LTerm[] = [];
+      const n0 = p.os.length;
       for (parse_skip(p); tm !== undefined && parse_take(p, "~"); parse_skip(p)) {
         ts.push(parse_term(p));
         parse_skip(p);
         parse_take(p, ",");
+      }
+      if (p.os.length > n0) {
+        // a ~ argument's operators are named now, not by an outer ": T"
+        throw Err(p.book, ctx_nil(), "the operators' namespace inside the ~ argument (as in (a + b : T))", undefined, parse_grow(p, out));
       }
       const xs = ts.concat(parse_term_args(p, ")"));
       const s  = parse_grow(p, out);

@@ -88,6 +88,7 @@ type File = Carb & {
   clos: Set<string>;
   img: string[];
   lits: Map<string, number>;
+  stats: Map<HTerm, Map<HTerm | null, Val>>;
   reqs: string;
   fuel: number;
 };
@@ -159,6 +160,10 @@ const BOX: Lay = { ks: ["box"], arms: null };
 const W64: Lay = { ks: ["w64"], arms: null };
 
 const WORDS: Record<string, Lay> = { U32: W32, F32: W32, Nat: W64 };
+
+// The machine's arity tables are u8: no segment takes, and no node holds,
+// more words than this, so a flat layout past it rides as a box.
+const ARITY_MAX = 255;
 
 const ERRS = ("|*|*|out of memory: run again with a bigger span, as in"
   + " --gpu 8GB|a function the device does not hold|a Nat past the"
@@ -611,6 +616,8 @@ const SPINES: Map<HTerm, Spine> = new Map();
 
 const NODES: Map<Bend.Name, Lay> = new Map();
 
+const LAYS: Map<string, Lay> = new Map();
+
 const CYCLES: Map<Bend.Name, boolean> = new Map();
 
 const CONSTS: Map<HTerm, boolean> = new Map();
@@ -934,16 +941,27 @@ function ty_clo(book: Bend.Book, A: HTerm | null,
 // ===
 
 // An Array is a block, and an IO.OP holds the foreign requests beyond its
-// constructors: boxes.
+// constructors: boxes. A layout is memoized per type (a product nested D
+// deep costs K^D to flatten otherwise), and one past the arity wall is a
+// box: the machine could not hold it flat anyway.
 function lay_of(book: Bend.Book, A: HTerm | null): Lay {
   const t = ty_adt(book, A);
   if (t === null) {
     return BOX;
   }
   const tld = book.tlds[t.k];
-  return WORDS[t.k] ?? (t.k === "Array" || t.k === "IO.OP" || tld?.$ !== "ADT"
-    || lay_cyclic(book, t.k) ? BOX : lay_pack(tld.c.map((c): Arm =>
-    ({ k: c.k, fs: lay_fields(book, ctr_doms(book, c, t.x)) }))));
+  if (WORDS[t.k] !== undefined) {
+    return WORDS[t.k];
+  }
+  if (t.k === "Array" || t.k === "IO.OP" || tld?.$ !== "ADT"
+    || lay_cyclic(book, t.k)) {
+    return BOX;
+  }
+  return memo(LAYS, Bend.term_key(Bend.term_lower(t)), () => {
+    const lay = lay_pack(tld.c.map((c): Arm =>
+      ({ k: c.k, fs: lay_fields(book, ctr_doms(book, c, t.x)) })));
+    return lay.ks.length > ARITY_MAX ? BOX : lay;
+  });
 }
 
 function lay_fields(book: Bend.Book, As: (HTerm | null)[]): Field[] {
@@ -1508,7 +1526,8 @@ function cid_mac(k: string): string {
 function file_new(cb: Carb, decl: string): File {
   return { ...cb, decl, segs: [], seg: seg_new("", BOX, []), tab: 2,
     cids: new Map(), tabs: new Map(), spins: [], spun: new Map(), clos: new Set(),
-    img: [], lits: new Map(), reqs: "", fuel: 0, fresh: new Map(), spares: [],
+    img: [], lits: new Map(), stats: new Map(), reqs: "", fuel: 0,
+    fresh: new Map(), spares: [],
     uses: new Map(), brwl: new Map(), rest: [], def: "" };
 }
 
@@ -2213,7 +2232,23 @@ function emit_clo(fl: File, x: HTerm, ty: HTerm | null): Val {
   return val_new([clo], BOX);
 }
 
+// A closed constructor whose value came out stat (its nodes in the image,
+// its words literals) is kept per (term, type): an unfolded constant
+// shares its subtrees, and emitting each occurrence again costs the
+// tree's size (K^D for a product nested D deep).
 function emit_ctr(fl: File, x: Of<"Ctr">, ty: HTerm | null): Val {
+  const got = fl.stats.get(x)?.get(ty);
+  if (got !== undefined) {
+    return got;
+  }
+  const v = emit_ctr_go(fl, x, ty);
+  if (v.stat && !term_any(fl, x, (y) => y.$ === "Var")) {
+    memo(fl.stats, x, () => new Map()).set(ty, v);
+  }
+  return v;
+}
+
+function emit_ctr_go(fl: File, x: Of<"Ctr">, ty: HTerm | null): Val {
   const [adt, u] = ctr_adt(fl, x, ty);
   if (u !== null) {
     return val_new([`${u}ull`], W32, true);
@@ -2763,8 +2798,8 @@ function compile_tables(fl: File, entries: Seg[]): string[] {
     defs.push(...ms.map((m, i) => `#define ${m} ${i}`));
   }
   const table = (nm: string, vals: number[]) => {
-    if (vals.some((v) => v > 255)) {
-      die("an arity over 255");
+    if (vals.some((v) => v > ARITY_MAX)) {
+      die("an arity over " + ARITY_MAX);
     }
     defs.push(`CONSTV u8 ${nm}[] = { ${vals.join(", ")} };`);
   };
